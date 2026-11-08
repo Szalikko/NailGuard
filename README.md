@@ -38,6 +38,8 @@ zsh build.command
 
 This builds `NailGuard.app` for Apple Silicon, signs it locally and runs the regression tests. All build resources are included.
 
-Detects proximity, not confirmed nail biting. Lighting, occlusion and head movement affect accuracy. The screenshot shows an earlier version of the real app with the camera disabled and no personal data loaded.
+Detects proximity, not confirmed nail biting. Lighting, occlusion and head movement affect accuracy. The screenshot shows NailGuard 1.6.1 with the camera preview disabled.
 
 <sub>Icon image supplied by the project owner.</sub>
+
+100% Vibecoded
