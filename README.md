@@ -1,8 +1,12 @@
+<p align="center"><img src="Assets/AppIcon.png" width="88" alt="NailGuard HRT icon"></p>
+
 # NailGuard HRT
 
 NailGuard HRT is a macOS menu bar app that uses your camera to notice fingers near your mouth. It can play a sound and show an overlay to help you catch a nail-biting habit and practise a different response with Habit Reversal Training (HRT).
 
 **Requires Apple Silicon and macOS 14 or later.** [Download NailGuard HRT 1.8.2](https://github.com/Szalikko/NailGuard/releases/tag/v1.8.2)
+
+![NailGuard HRT 1.8.2 Monitoring window](docs/screenshot.png)
 
 ## Get started
 
