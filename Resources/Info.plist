@@ -7,15 +7,15 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.dawid.NailGuard</string>
+	<string>local.dawid.NailGuard.HRT</string>
 	<key>CFBundleName</key>
-	<string>NailGuard</string>
+	<string>NailGuard HRT</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.6.1</string>
+	<string>1.8.2</string>
 	<key>CFBundleVersion</key>
-	<string>9</string>
+	<string>22</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>

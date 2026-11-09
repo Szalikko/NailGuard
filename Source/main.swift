@@ -4,6 +4,7 @@ import Vision
 import SwiftUI
 import Charts
 import ServiceManagement
+import Carbon
 
 enum AppMode { static let screenshot = CommandLine.arguments.contains("--screenshot") || Bundle.main.object(forInfoDictionaryKey: "NailGuardScreenshotMode") as? Bool == true }
 
@@ -19,32 +20,45 @@ struct History: Codable { var episodes: [Episode] = []; var monitored: [String: 
 func dayKey(_ date: Date) -> String { calendarDayKey(date, calendar: .current) }
 
 struct Settings: Codable, Equatable {
-    var sensitivity = 0.20
-    var hold = 0.6
-    var rearm = 1.2
+    static let overlayPositions = ["Top Left", "Top", "Top Right", "Left", "Center", "Right", "Bottom Left", "Bottom", "Bottom Right"]
+    static let followOverlayPosition = "Same as overlay"
+
+    var sensitivity = 0.1
+    var hold = 1.0
+    var rearm = 1.0
     var sound = true
-    var soundName = "Glass"
-    var volume = 0.6
-    var repeatAlarm = false
-    var repeatSeconds = 5.0
+    var soundName = "Basso"
+    var volume = 1.0
+    var repeatAlarm = true
+    var repeatSeconds = 2.0
+    var hrtCheckIn = true
+    var hrtFinishSound = "Ping"
+    var hrtFinishVolume = 1.0
+    var hrtAutoDock = true
+    var hrtDockPosition = Settings.followOverlayPosition
     var overlay = true
-    var overlaySeconds = 3.0
+    var overlaySeconds = 2.0
     var overlayWidth = 420.0
     var overlayPosition = "Top"
     var screenID = "all"
     var overlayPhoto = true
-    var analysisFPS = 6.0
+    var analysisFPS = 5.0
     var resolution = "640 × 480"
-    var previewFPS = 4.0
+    var previewFPS = 5.0
     var adaptive = true
     var efficientFaceUpdates = true
     var saveSnapshots = true
     var snapshotDays = 14.0
     var snapshotLimit = 200.0
+    var overlayAccent = "Red"
     var overlayStyle = "Card"
-    var dim = 0.0
+    var dim = 0.5
     var autoMonitor = false
     var resumeAfterUnlock = false
+    var resolvedHRTDockPosition: String {
+        hrtDockPosition == Self.followOverlayPosition ? overlayPosition : hrtDockPosition
+    }
+
     static func load(_ data: Data?) -> Settings {
         guard let data, var old = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let defaults = try? JSONEncoder().encode(Settings()),
@@ -52,11 +66,14 @@ struct Settings: Codable, Equatable {
         if let position = old["overlayPosition"] as? String { old["overlayPosition"] = ["Góra":"Top", "Środek":"Center", "Dół":"Bottom"][position] ?? position }
         for (key, value) in old { merged[key] = value }
         guard let encoded = try? JSONSerialization.data(withJSONObject: merged), var result = try? JSONDecoder().decode(Settings.self, from: encoded) else { return Settings() }
+        if !OverlayAccent.allCases.map(\.rawValue).contains(result.overlayAccent) { result.overlayAccent = Settings().overlayAccent }
         if result.overlayStyle != "Banner" { result.overlayStyle = "Card" }
+        if !(["None"] + soundNames).contains(result.hrtFinishSound) { result.hrtFinishSound = "Ping" }
+        result.hrtFinishVolume = min(1, max(0, result.hrtFinishVolume))
         result.hold = min(2, max(0, result.hold)); result.analysisFPS = min(15, max(2, result.analysisFPS))
         result.previewFPS = min(10, max(1, result.previewFPS)); result.volume = min(1, max(0, result.volume))
         result.rearm = min(4, max(0.3, result.rearm))
-        result.repeatSeconds = min(30, max(2, result.repeatSeconds))
+        result.repeatSeconds = min(5, max(1, result.repeatSeconds))
         result.overlaySeconds = min(10, max(1, result.overlaySeconds))
         result.overlayWidth = min(640, max(280, result.overlayWidth))
         result.dim = min(0.75, max(0, result.dim))
@@ -64,8 +81,9 @@ struct Settings: Codable, Equatable {
         result.snapshotLimit = min(1000, max(50, result.snapshotLimit))
         result.sensitivity = min(0.35, max(0.08, result.sensitivity))
         if !["640 × 480", "1280 × 720", "1920 × 1080"].contains(result.resolution) { result.resolution = "640 × 480" }
-        if !["Top Left", "Top", "Top Right", "Left", "Center", "Right", "Bottom Left", "Bottom", "Bottom Right"].contains(result.overlayPosition) { result.overlayPosition = "Top" }
-        if !soundNames.contains(result.soundName) { result.soundName = "Glass" }
+        if !overlayPositions.contains(result.overlayPosition) { result.overlayPosition = "Top" }
+        if !overlayPositions.contains(result.hrtDockPosition) { result.hrtDockPosition = followOverlayPosition }
+        if !soundNames.contains(result.soundName) { result.soundName = Settings().soundName }
         return result
     }
 }
@@ -98,6 +116,7 @@ struct GestureGate {
 }
 
 final class Model: NSObject, ObservableObject {
+    let training = PracticeController()
     @Published var dataBusy = false
     @Published var dataMessage = ""
     @Published var detectionState = "Monitoring paused"
@@ -135,20 +154,28 @@ final class Model: NSObject, ObservableObject {
         if AppMode.screenshot { return Settings() }
         if let data = UserDefaults.standard.data(forKey: "settings.v13") ?? UserDefaults.standard.data(forKey: "settings.v12") ?? UserDefaults.standard.data(forKey: "settings.v11") { return Settings.load(data) }
         var value = Settings()
-        value.sensitivity = UserDefaults.standard.object(forKey: "sensitivity") as? Double ?? 0.20
-        value.hold = UserDefaults.standard.object(forKey: "hold") as? Double ?? 0.6
+        value.sensitivity = UserDefaults.standard.object(forKey: "sensitivity") as? Double ?? value.sensitivity
+        value.hold = UserDefaults.standard.object(forKey: "hold") as? Double ?? value.hold
         return value
     }() { didSet {
         if !AppMode.screenshot, let data = try? JSONEncoder().encode(settings) { UserDefaults.standard.set(data, forKey: "settings.v13") }
         if oldValue.soundName != settings.soundName { playSound() }
+        if oldValue.hrtFinishSound != settings.hrtFinishSound && settings.hrtFinishSound != "None" {
+            playSound(name: settings.hrtFinishSound, volume: settings.hrtFinishVolume)
+        }
         configureDetector()
+        if !settings.repeatAlarm || !settings.overlay { overlays.endRepeatingAlert() }
+        if oldValue.repeatAlarm != settings.repeatAlarm || oldValue.hrtDockPosition != settings.hrtDockPosition || oldValue.overlayAccent != settings.overlayAccent || oldValue.overlayWidth != settings.overlayWidth || oldValue.overlayPosition != settings.overlayPosition || oldValue.overlayStyle != settings.overlayStyle || oldValue.overlayPhoto != settings.overlayPhoto || oldValue.dim != settings.dim || oldValue.screenID != settings.screenID { training.refreshOverlay() }
     } }
     @Published var previewEnabled = true { didSet { configureDetector(); if !previewEnabled { debugFrame = nil } } }
     @Published var tab = 0 { didSet { configureDetector(); if tab != 0 { debugFrame = nil }; resetHistory(); refreshStatistics() } }
     @Published var windowVisible = true { didSet { configureDetector(); if !windowVisible { debugFrame = nil } } }
     @Published var debugFrame: DebugFrame?
     @Published var screens: [(String, String)] = []
-    private var lastAlert = Date.distantPast
+    private var practiceSnapshot: NSImage?
+    private var practiceOfferEpisodeID: UUID?
+    private var alertEscalation = AlertEscalation()
+    private let boostedSound = BoostedAlertSound()
     private var playingSound: NSSound?
     let capture = Capture()
     let overlays = OverlayManager()
@@ -157,7 +184,7 @@ final class Model: NSObject, ObservableObject {
     private var lastStart = Date()
     private var activeID: UUID?
     private var resumeState = MonitoringResumeState()
-    private let storage = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NailGuard/history.json")
+    private let storage = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NailGuard-HRT/history.json")
     var today: [Episode] { history.episodes.filter { Calendar.current.isDateInToday($0.start) && !$0.falseAlarm } }
     var todaySeconds: Double { history.monitored[dayKey(Date())] ?? 0 }
     override init() {
@@ -170,6 +197,21 @@ final class Model: NSObject, ObservableObject {
                 dataMessage = status
             }
         }
+        training.onInteraction = { [weak self] in self?.playingSound?.stop() }
+        training.onPresent = { [weak self] in
+            guard let self else { return }
+            let escalation = self.settings.repeatAlarm && self.canRepeatPracticeOffer ? self.alertEscalation.level : 0
+            self.overlays.showPractice(training: self.training, image: self.training.sessionSource == .camera ? self.practiceSnapshot : nil, settings: self.settings, escalation: escalation)
+        }
+        training.onDismiss = { [weak self] in
+            self?.practiceOfferEpisodeID = nil
+            self?.practiceSnapshot = nil
+            self?.overlays.hide()
+        }
+        training.onFinish = { [weak self] in
+            guard let self, self.settings.hrtFinishSound != "None" else { return }
+            self.playSound(name: self.settings.hrtFinishSound, volume: self.settings.hrtFinishVolume)
+        }
         refreshScreens()
         refreshLoginStatus()
         configureDetector()
@@ -180,7 +222,7 @@ final class Model: NSObject, ObservableObject {
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(screenLocked), name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(screenUnlocked), name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
     }
-    func configureDetector() { capture.configure(settings: settings, preview: previewEnabled && tab == 0 && windowVisible) }
+    func configureDetector() { training.autoDock = settings.hrtAutoDock; training.checkInEnabled = settings.hrtCheckIn; capture.configure(settings: settings, preview: previewEnabled && tab == 0 && windowVisible) }
     func refreshScreens() { screens = NSScreen.screens.map { (String(($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0), $0.localizedName) } }
     func profile(_ name: String) {
         switch name {
@@ -195,6 +237,7 @@ final class Model: NSObject, ObservableObject {
     @objc func screenUnlocked() { releaseSuspension(.screenLock) }
     @objc func systemDidWake() { releaseSuspension(.systemSleep) }
     private func suspendMonitoring(_ reason: MonitoringResumeState.Reason) {
+        training.end()
         resumeState.suspend(reason, wasRunning: running)
         if running {
             stop(cancelPendingResume: false)
@@ -215,8 +258,9 @@ final class Model: NSObject, ObservableObject {
         }
     }
     private func begin() { guard !running && !dataBusy && storageReadable && !resumeState.isSuspended else { return }; resumeState.cancel(); running = true; lastTick = Date(); lastStart = Date(); status = "Starting camera…"; capture.start() }
-    func stop(cancelPendingResume: Bool = true) { if cancelPendingResume { resumeState.cancel() }; running = false; capture.stop(); finishEpisode(); overlays.hide(); snapshot = nil; debugFrame = nil; actualCamera = "Not running"; detectionState = "Monitoring paused"; fps = 0; latency = 0; status = "Monitoring paused"; save() }
+    func stop(cancelPendingResume: Bool = true) { if cancelPendingResume { resumeState.cancel() }; running = false; capture.stop(); finishEpisode(); if !training.busy { overlays.hide() }; snapshot = nil; debugFrame = nil; actualCamera = "Not running"; detectionState = "Monitoring paused"; fps = 0; latency = 0; status = "Monitoring paused"; save() }
     private func tick() {
+        training.tick()
         let now = Date(); let elapsed = min(now.timeIntervalSince(lastTick), 2); lastTick = now
         if running && capture.isFresh { history.monitored[dayKey(now), default: 0] += elapsed; dirty = true }
         if let id = activeID, let i = history.episodes.firstIndex(where: { $0.id == id }) { history.episodes[i].duration = now.timeIntervalSince(history.episodes[i].start) }
@@ -226,7 +270,19 @@ final class Model: NSObject, ObservableObject {
         if tickCount % 10 == 0 { if dirty { save() }; refreshStatistics() }
         if tickCount % 60 == 0 { pruneSnapshots() }
     }
-    private func finishEpisode() { if activeID != nil { dirty = true; refreshStatistics() }; activeID = nil }
+    private var canRepeatPracticeOffer: Bool {
+        guard let activeID else { return false }
+        return training.cameraOfferPending && activeID == practiceOfferEpisodeID
+    }
+
+    private func finishEpisode() {
+        let resetPracticeSize = canRepeatPracticeOffer && alertEscalation.level > 0
+        if activeID != nil { dirty = true; refreshStatistics() }
+        activeID = nil
+        alertEscalation.reset()
+        overlays.endRepeatingAlert(after: settings.overlaySeconds)
+        if resetPracticeSize { training.refreshOverlay() }
+    }
     private func receive(_ r: Detection) {
         guard running else { return }
         if let error = r.error { stop(); status = error; return }
@@ -236,6 +292,7 @@ final class Model: NSObject, ObservableObject {
             status = r.message; detectionState = r.phase; fps = r.fps; latency = r.milliseconds; actualCamera = r.camera; lastUIPublish = now
         }
         if !r.active { finishEpisode() }
+        else if !r.near { overlays.endRepeatingAlert(after: settings.overlaySeconds) }
         if r.trigger {
             var event = Episode(start: Date(), duration: 0)
             event.zones = r.zones
@@ -245,21 +302,62 @@ final class Model: NSObject, ObservableObject {
             }
             history.episodes.append(event); activeID = event.id
             snapshot = r.image
-            alert(image: r.image); lastAlert = Date(); save(); refreshStatistics()
-        } else if r.near && r.active && settings.repeatAlarm && Date().timeIntervalSince(lastAlert) >= settings.repeatSeconds {
-            alert(image: r.image ?? snapshot); lastAlert = Date()
+            alertEscalation.begin(at: now)
+            alert(image: r.image)
+            save()
+            refreshStatistics()
+        } else if r.near && r.active && settings.repeatAlarm {
+            repeatAlert(at: now, image: r.image ?? snapshot)
         }
     }
-    func playSound() {
-        if let audio = NSSound(named: NSSound.Name(settings.soundName))?.copy() as? NSSound {
-            playingSound?.stop(); audio.volume = Float(settings.volume); playingSound = audio; audio.play()
+
+    private func repeatAlert(at time: TimeInterval, image: NSImage?) {
+        let usingHRT = training.preferences.enabled && training.available
+        guard !usingHRT || canRepeatPracticeOffer else { return }
+        let previousLevel = alertEscalation.level
+        guard let level = alertEscalation.repeatIfDue(at: time, interval: settings.repeatSeconds) else { return }
+        if usingHRT {
+            if settings.sound { playSound(escalation: level) }
+            if level != previousLevel { training.refreshOverlay() }
+        } else {
+            ordinaryAlert(image: image, escalation: level, repeating: true)
         }
     }
+
+    func playSound(name: String? = nil, volume: Double? = nil, escalation: Int = 0) {
+        let name = name ?? settings.soundName
+        let volume = volume ?? settings.volume
+        let louder = escalation > 0 && volume > 0 ? boostedSound.sound(named: name, volume: volume, level: escalation) : nil
+        guard let audio = louder ?? (NSSound(named: NSSound.Name(name))?.copy() as? NSSound) else { return }
+        playingSound?.stop()
+        audio.volume = louder == nil ? Float(volume) : 1
+        playingSound = audio
+        audio.play()
+    }
+
     func alert(image: NSImage?) {
-        if settings.sound { playSound() }
-        if settings.overlay { overlays.show(image: settings.overlayPhoto ? image : nil, settings: settings) }
+        if training.preferences.enabled && training.available {
+            if !training.busy { practiceSnapshot = image }
+            if training.offerFromCamera() {
+                practiceOfferEpisodeID = activeID
+                if settings.sound { playSound() }
+            }
+            return
+        }
+        ordinaryAlert(image: image, repeating: settings.repeatAlarm)
     }
-    func testAlert() { alert(image: debugFrame?.image) }
+
+    func ordinaryAlert(image: NSImage?, escalation: Int = 0, repeating: Bool = false) {
+        if settings.sound { playSound(escalation: escalation) }
+        if settings.overlay { overlays.show(image: settings.overlayPhoto ? image : nil, settings: settings, escalation: escalation, repeating: repeating) }
+    }
+    func testAlert() {
+        switch training.phase {
+        case .idle: ordinaryAlert(image: debugFrame?.image)
+        case .offered, .active: training.present()
+        case .review: training.refreshOverlay()
+        }
+    }
     func save() {
         guard !AppMode.screenshot && storageReadable && !dataBusy else { return }
         let value = history
@@ -537,59 +635,165 @@ final class Capture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         }
     }
 }
+final class InteractiveOverlayPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
 final class OverlayManager {
     private var panels: [NSPanel] = []
     private var dismissal: DispatchWorkItem?
-    func hide() { dismissal?.cancel(); panels.forEach { $0.orderOut(nil) }; panels.removeAll() }
-    private func panel(_ frame: CGRect, level: NSWindow.Level) -> NSPanel {
-        let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    private enum PersistentOverlay { case repeatingAlert, practice }
+    private var persistentOverlay: PersistentOverlay?
+    private var reusableCards: [NSPanel] = []
+    private var reusableScreenFrames: [CGRect] = []
+    private var reusableDim = 0.0
+
+    func hide() {
+        dismissal?.cancel()
+        dismissal = nil
+        panels.forEach { $0.orderOut(nil) }
+        panels.removeAll()
+        persistentOverlay = nil
+        reusableCards.removeAll()
+        reusableScreenFrames.removeAll()
+    }
+
+    func endRepeatingAlert(after duration: TimeInterval = 0) {
+        guard persistentOverlay == .repeatingAlert else { return }
+        if duration == 0 {
+            hide()
+            return
+        }
+
+        // Switch out of repeat mode so later camera frames cannot restart the dismissal clock.
+        persistentOverlay = nil
+        scheduleDismissal(after: duration)
+    }
+
+    private func scheduleDismissal(after duration: TimeInterval) {
+        dismissal?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.hide() }
+        dismissal = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+    private func panel(_ frame: CGRect, level: NSWindow.Level, interactive: Bool = false) -> NSPanel {
+        let p = InteractiveOverlayPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.level = level; p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = false
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]; p.ignoresMouseEvents = true
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]; p.ignoresMouseEvents = !interactive
         return p
     }
-    func show(image: NSImage?, settings: Settings) {
-        hide()
-        let available = NSScreen.screens
-        let selected = available.filter { settings.screenID == "all" || String(($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0) == settings.screenID }
-        for screen in selected.isEmpty ? Array(available.prefix(1)) : selected {
-            if settings.dim > 0 {
-                let dimmer = panel(screen.frame, level: .floating)
-                dimmer.backgroundColor = NSColor.black.withAlphaComponent(settings.dim)
-                dimmer.orderFrontRegardless(); panels.append(dimmer)
-            }
-            let width = min(CGFloat(settings.overlayWidth), screen.visibleFrame.width - 32)
-            let baseHeight: CGFloat = settings.overlayStyle == "Card" ? 310 : 76
-            let height = width * baseHeight / 420
-            let y = settings.overlayPosition.contains("Bottom") ? screen.visibleFrame.minY + 24 : settings.overlayPosition.contains("Top") ? screen.visibleFrame.maxY - height - 24 : screen.visibleFrame.midY - height / 2
-            let x = settings.overlayPosition.contains("Left") ? screen.visibleFrame.minX + 24 : settings.overlayPosition.contains("Right") ? screen.visibleFrame.maxX - width - 24 : screen.visibleFrame.midX - width / 2
-            let p = panel(CGRect(x: x, y: y, width: width, height: height), level: NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1))
-            p.hasShadow = true
-            p.contentView = NSHostingView(rootView: AlertView(image: image, style: settings.overlayStyle).scaleEffect(width / 420).frame(width: width, height: height))
-            p.orderFrontRegardless(); panels.append(p)
+    private func fittedContent<Content: View>(_ content: Content, width: CGFloat, maxHeight: CGFloat) -> NSHostingView<AnyView> {
+        let root = content.frame(width: width).fixedSize(horizontal: false, vertical: true).environment(\.locale, Locale(identifier: "en_US"))
+        let host = NSHostingView(rootView: AnyView(root))
+        let height = min(maxHeight, max(1, ceil(host.fittingSize.height)))
+        if host.fittingSize.height > maxHeight {
+            host.rootView = AnyView(ScrollView { root }.frame(width: width, height: height))
         }
-        let work = DispatchWorkItem { [weak self] in self?.hide() }; dismissal = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + settings.overlaySeconds, execute: work)
+        host.setFrameSize(NSSize(width: width, height: height))
+        return host
+    }
+    func showPractice(training: PracticeController, image: NSImage?, settings: Settings, escalation: Int = 0) {
+        let compact = training.overlayMinimized
+        let position = compact ? settings.resolvedHRTDockPosition : settings.overlayPosition
+        let photo = settings.overlayPhoto && settings.overlayStyle == "Card" ? image : nil
+        let shouldDim = !compact && (training.phase == .active || training.phase == .offered)
+        let width = compact ? 280 : scaledWidth(settings.overlayWidth, escalation: escalation)
+        let accent = OverlayAccent(rawValue: settings.overlayAccent)?.color ?? .orange
+
+        presentCards(settings: settings, kind: .practice, width: width, position: position, compact: compact,
+                     dim: shouldDim ? settings.dim : 0) { width in
+            PracticeOverlayView(training: training, accent: accent, width: width, image: photo,
+                                banner: settings.overlayStyle == "Banner", compact: compact)
+        }
+    }
+
+    func show(image: NSImage?, settings: Settings, escalation: Int = 0, repeating: Bool = false) {
+        let accent = OverlayAccent(rawValue: settings.overlayAccent)?.color ?? .orange
+        presentCards(settings: settings, kind: repeating ? .repeatingAlert : nil,
+                     width: scaledWidth(settings.overlayWidth, escalation: escalation),
+                     position: settings.overlayPosition, dim: settings.dim) { width in
+            AlertView(image: image, style: settings.overlayStyle, width: width, accent: accent, escalation: escalation)
+        }
+        if !repeating { scheduleDismissal(after: settings.overlaySeconds) }
+    }
+
+    private func scaledWidth(_ width: Double, escalation: Int) -> CGFloat {
+        CGFloat(width) * (1 + CGFloat(escalation) * 0.12)
+    }
+
+    private func presentCards<Content: View>(settings: Settings, kind: PersistentOverlay?, width: CGFloat,
+                                             position: String, compact: Bool = false, dim: Double,
+                                             content: (CGFloat) -> Content) {
+        let available = NSScreen.screens
+        let selected = available.filter {
+            let screenID = ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+            return settings.screenID == "all" || String(screenID) == settings.screenID
+        }
+        let screens = selected.isEmpty ? Array(available.prefix(1)) : selected
+        let frames = screens.map(\.frame)
+        let reuse = kind != nil && kind == persistentOverlay && !reusableCards.isEmpty
+            && reusableScreenFrames == frames && reusableDim == dim
+        if !reuse { hide() }
+
+        for (index, screen) in screens.enumerated() {
+            if !reuse && dim > 0 {
+                let dimmer = panel(screen.frame, level: .floating)
+                dimmer.backgroundColor = NSColor.black.withAlphaComponent(dim)
+                dimmer.orderFrontRegardless()
+                panels.append(dimmer)
+            }
+            let cardWidth = min(width, screen.visibleFrame.width - 48)
+            let hosting = fittedContent(content(cardWidth), width: cardWidth, maxHeight: screen.visibleFrame.height - 48)
+            let frame = practiceOverlayFrame(visible: screen.visibleFrame, size: hosting.frame.size,
+                                             compact: compact, position: position, screen: screen.frame)
+            if reuse {
+                let card = reusableCards[index]
+                card.contentView = hosting
+                card.setFrame(frame, display: true)
+            } else {
+                let level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+                let card = panel(frame, level: level, interactive: kind == .practice)
+                card.hasShadow = true
+                card.contentView = hosting
+                card.orderFrontRegardless()
+                panels.append(card)
+                if kind != nil { reusableCards.append(card) }
+            }
+        }
+
+        persistentOverlay = kind
+        reusableScreenFrames = frames
+        reusableDim = dim
     }
 }
+
 struct AlertView: View {
     let image: NSImage?
     let style: String
+    let width: CGFloat
+    let accent: Color
+    let escalation: Int
+    private var padding: CGFloat { image == nil ? 18 + CGFloat(escalation) * 2 : 18 }
     var body: some View {
         Group {
             if style == "Card" {
                 VStack(spacing: 12) {
                     Label("Move your hand away", systemImage: "hand.raised.fill").font(.title2.bold())
-                    if let image { Image(nsImage: image).resizable().scaledToFit().frame(height: 210).clipShape(RoundedRectangle(cornerRadius: 10)) }
-                    else { Image(systemName: "hand.raised.slash.fill").font(.system(size: 90)).frame(height: 210) }
-                }.padding(18).frame(width: 420, height: 310)
+                    if let image {
+                        let size = overlaySnapshotSize(image: image.size, width: width - 2 * padding)
+                        Image(nsImage: image).resizable().scaledToFit().frame(width: size.width, height: size.height).clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    else { Image(systemName: "hand.raised.slash.fill").font(.system(size: 90)).frame(height: 160 + CGFloat(escalation) * 8) }
+                }.padding(padding).frame(maxWidth: .infinity)
             } else {
-                Label("Hands away · take a breath", systemImage: "hand.raised.fill").font(.title3.bold()).frame(width: 420, height: 76)
+                Label("Hands away · take a breath", systemImage: "hand.raised.fill").font(.title3.bold()).padding(20 + CGFloat(escalation) * 4).frame(maxWidth: .infinity)
             }
-        }.background(Color(nsColor: .windowBackgroundColor)).overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.orange, lineWidth: 4)).clipShape(RoundedRectangle(cornerRadius: 16))
+        }.background(Color(nsColor: .windowBackgroundColor)).overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(accent, lineWidth: 3)).clipShape(RoundedRectangle(cornerRadius: 16))
     }
 }
 struct MainView: View {
     @ObservedObject var model: Model
+    @ObservedObject var training: PracticeController
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
@@ -603,12 +807,21 @@ struct MainView: View {
                 Picker("View", selection: $model.tab) {
                     Text("Monitoring").tag(0)
                     Text("Statistics").tag(1)
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 260)
+                    Text("HRT Practice").tag(2)
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 330)
             }.padding(.horizontal, 20).frame(height: 64)
             Divider()
+            if training.busy && model.tab != 2 {
+                HStack {
+                    Label(training.phase == .active ? "HRT Practice in progress · " + training.shortTime : training.phase == .offered ? "Ready to practise · start when you are ready" : "HRT timer finished · check in when ready", systemImage: "hands.sparkles")
+                    Spacer()
+                    Button("Open HRT Practice") { model.tab = 2 }
+                }.padding(.horizontal, 20).padding(.vertical, 10).background(Color.accentColor.opacity(0.08))
+            }
             Group {
                 if model.tab == 0 { MonitorView(model: model) }
-                else { StatisticsView(model: model) }
+                else if model.tab == 2 { PracticeView(training: training, model: model) }
+                else { StatisticsView(model: model, training: training) }
             }.frame(maxWidth: .infinity, maxHeight: .infinity).disabled(model.dataBusy)
         }.frame(minWidth: 1040, minHeight: 700)
     }
@@ -642,7 +855,7 @@ struct MonitorView: View {
                 Text("Adjust the controls on the right while watching the preview. Changes apply immediately and save automatically.").font(.caption).foregroundStyle(.secondary)
                 Spacer(minLength: 0)
             }.padding(20).frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            ControlsView(model: model).frame(minWidth: 490, idealWidth: 510, maxWidth: 600)
+            ControlsView(model: model, training: model.training).frame(minWidth: 490, idealWidth: 510, maxWidth: 600)
         }
     }
 }
@@ -671,6 +884,7 @@ struct CameraPreview: View {
 }
 struct StatisticsView: View {
     @ObservedObject var model: Model
+    @ObservedObject var training: PracticeController
     var data: StatisticsSummary { model.statistics }
     var body: some View {
         ScrollView {
@@ -728,6 +942,7 @@ struct StatisticsView: View {
                     }.chartYScale(domain: 0...max(1, data.bins.map(\.count).max() ?? 1)).frame(height: 240)
                     Text("False alarms are excluded. Empty hours and days are included. Custom dates are inclusive; reversed dates are automatically ordered.").font(.caption).foregroundStyle(.secondary)
                 }.padding(18).background(.quaternary).clipShape(RoundedRectangle(cornerRadius: 12))
+                PracticeStatistics(training: training, interval: data.window.interval)
                 DisclosureGroup(isExpanded: $model.historyExpanded) {
                     eventHistory.padding(.top, 12)
                 } label: {
@@ -786,6 +1001,7 @@ struct StatisticsView: View {
 }
 struct ControlsView: View {
     @ObservedObject var model: Model
+    @ObservedObject var training: PracticeController
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Picker("Adjust", selection: $model.controlPage) {
@@ -803,7 +1019,10 @@ struct ControlsView: View {
     }
     var reset: some View {
         Section("Defaults") {
-            Button("Restore default settings") { model.settings = Settings() }
+            Button("Restore default settings") {
+                model.settings = Settings()
+                if training.available { training.preferences = PracticePreferences() }
+            }.disabled(training.busy || training.resetting)
             Text("Settings save automatically. This does not delete history or change login registration.").font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -823,18 +1042,42 @@ struct ControlsView: View {
             Picker("Sound", selection: $model.settings.soundName) { ForEach(soundNames, id: \.self) { Text($0).tag($0) } }
             slider("Volume", value: $model.settings.volume, range: 0...1, step: 0.05)
             Toggle("Repeat while fingers remain near mouth", isOn: $model.settings.repeatAlarm)
-            if model.settings.repeatAlarm { slider("Repeat interval (s)", value: $model.settings.repeatSeconds, range: 2...30, step: 1) }
+            if model.settings.repeatAlarm {
+                slider("Repeat interval (s)", value: $model.settings.repeatSeconds, range: 1...5, step: 1)
+                Text("The alert grows and gets louder over the first three repeats, then stays at the highest level.").font(.caption).foregroundStyle(.secondary)
+                if training.preferences.enabled {
+                    Text("HRT repeats apply to camera invitations before you start the timer.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
             Button("Test sound and overlay") { model.testAlert() }
         }
     }
     var overlay: some View {
         Section("Overlay") {
-            Toggle("Show overlay", isOn: $model.settings.overlay)
+            if training.preferences.enabled && training.available {
+                Text("HRT always shows its countdown overlay until the timer ends, independently of the ordinary overlay switch and duration. Card/Banner style, snapshots, position, dimming and display selection also apply to HRT. Docking removes dimming.").font(.caption).foregroundStyle(.secondary)
+            }
+            Toggle(training.preferences.enabled ? "Show ordinary overlay when HRT is off" : "Show overlay", isOn: $model.settings.overlay)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack { Text("Accent color"); Spacer(); Text(model.settings.overlayAccent).foregroundStyle(.secondary) }
+                HStack(spacing: 12) {
+                    ForEach(OverlayAccent.allCases) { accent in
+                        Button { model.settings.overlayAccent = accent.rawValue } label: {
+                            Circle().fill(accent.color).frame(width: 22, height: 22).padding(4)
+                                .overlay(Circle().strokeBorder(model.settings.overlayAccent == accent.rawValue ? Color.primary : .clear, lineWidth: 2))
+                        }.buttonStyle(.plain).help(accent.rawValue).accessibilityLabel(accent.rawValue)
+                            .accessibilityValue(model.settings.overlayAccent == accent.rawValue ? "Selected" : "Not selected")
+                    }
+                }
+            }
             Picker("Style", selection: $model.settings.overlayStyle) { ForEach(["Card", "Banner"], id: \.self) { Text($0).tag($0) } }
             Toggle("Include snapshot · Card style", isOn: $model.settings.overlayPhoto)
-            slider("Duration (s)", value: $model.settings.overlaySeconds, range: 1...10, step: 0.5)
+            slider(training.preferences.enabled ? "Ordinary alert duration (s)" : "Duration (s)", value: $model.settings.overlaySeconds, range: 1...10, step: 0.5)
+            if model.settings.repeatAlarm && !training.preferences.enabled {
+                Text("With repeats enabled, this time starts when you move your hand away.").font(.caption).foregroundStyle(.secondary)
+            }
             slider("Width (points)", value: $model.settings.overlayWidth, range: 280...640, step: 20)
-            Picker("Position", selection: $model.settings.overlayPosition) { ForEach(["Top Left", "Top", "Top Right", "Left", "Center", "Right", "Bottom Left", "Bottom", "Bottom Right"], id: \.self) { Text($0).tag($0) } }
+            Picker("Position", selection: $model.settings.overlayPosition) { ForEach(Settings.overlayPositions, id: \.self) { Text($0).tag($0) } }
             slider("Background dimming", value: $model.settings.dim, range: 0...0.75, step: 0.05)
             Text("Dimming applies to selected displays for the alert duration. It does not intercept clicks or change display brightness.").font(.caption).foregroundStyle(.secondary)
             Picker("Display", selection: $model.settings.screenID) {
@@ -870,8 +1113,8 @@ struct ControlsView: View {
     }
     var dataActions: some View {
         Section("Manage data") {
-            Button("Reset statistics...", role: .destructive) { model.confirmDataAction(.resetStatistics) }
-            Text("Clear detection history and monitored time. Saved photo files are kept.").font(.caption).foregroundStyle(.secondary)
+            Button("Reset detection statistics...", role: .destructive) { model.confirmDataAction(.resetStatistics) }
+            Text("Clear detection history and monitored time. Saved photos and practice statistics are kept.").font(.caption).foregroundStyle(.secondary)
             Button("Delete snapshots...", role: .destructive) { model.confirmDataAction(.deleteSnapshots) }
             Text("Move saved event photos to Trash. Keep detection history and totals.").font(.caption).foregroundStyle(.secondary)
             if !model.dataMessage.isEmpty { Text(model.dataMessage).font(.caption).textSelection(.enabled) }
@@ -897,6 +1140,7 @@ struct PerformanceView: View {
         VStack(alignment: .leading, spacing: 5) {
             Text(String(format: "%.1f fps · %.0f ms/frame · CPU %.1f%%", model.fps, model.latency, model.cpu)).monospacedDigit()
                 .help("CPU is averaged over about 2 seconds. 100% means one CPU core. GPU and Neural Engine energy are not included. Frame time is processing time, not total alert latency.")
+            Text("100% CPU = one fully used core").font(.caption).foregroundStyle(.secondary)
             Text(model.running ? "Camera: \(model.actualCamera)" : "Camera off").font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -905,19 +1149,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = Model()
     var window: NSWindow!
     var item: NSStatusItem!
+    private var practiceHotKey: EventHotKeyRef?
+    private var practiceHandler: EventHandlerRef?
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"), let icon = NSImage(contentsOf: url) { NSApp.applicationIconImage = icon }
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1160, height: 820), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.delegate = self; window.title = "NailGuard 1.6.1"; window.isReleasedWhenClosed = false; window.contentView = NSHostingView(rootView: MainView(model: model).environment(\.locale, Locale(identifier: "en_US"))); window.center()
+        window.delegate = self; window.title = "NailGuard HRT" + ((Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String).map { " " + $0 } ?? ""); window.isReleasedWhenClosed = false; window.contentView = NSHostingView(rootView: MainView(model: model, training: model.training).environment(\.locale, Locale(identifier: "en_US"))); window.center()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = NSImage(systemSymbolName: "hand.raised", accessibilityDescription: "NailGuard")
-        item.button?.toolTip = "NailGuard"
+        item.button?.toolTip = "NailGuard HRT"
         item.button?.setAccessibilityLabel("NailGuard")
         let menu = NSMenu()
-        for (title, action) in [("Open NailGuard", #selector(openWindow)), ("Start / pause", #selector(toggle)), ("Quit", #selector(quit))] { let i = NSMenuItem(title: title, action: action, keyEquivalent: ""); i.target = self; menu.addItem(i) }
+        let openItem = NSMenuItem(title: "Open NailGuard HRT", action: #selector(openWindow), keyEquivalent: "")
+        openItem.target = self
+        menu.addItem(openItem)
+        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "")
+        quitItem.target = self
+        menu.addItem(quitItem)
         item.menu = menu
         let appMenu = NSMenu(); let root = NSMenuItem(); root.submenu = NSMenu()
         let quit = NSMenuItem(title: "Quit NailGuard", action: #selector(quit), keyEquivalent: "q"); quit.target = self; root.submenu?.addItem(quit); appMenu.addItem(root); NSApp.mainMenu = appMenu
+        registerPracticeShortcut()
         openWindow()
         if model.settings.autoMonitor { model.start() }
     }
@@ -925,7 +1177,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowDidMiniaturize(_ notification: Notification) { model.windowVisible = false }
     func windowDidDeminiaturize(_ notification: Notification) { model.windowVisible = true }
     @objc func openWindow() { model.windowVisible = true; if window.isMiniaturized { window.deminiaturize(nil) }; NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil) }
-    @objc func toggle() { model.running ? model.stop() : model.start() }
+    @objc func openPractice() { model.tab = 2; openWindow() }
+    @objc func noticedUrge() {
+        guard model.training.preferences.enabled && model.training.available else { openPractice(); return }
+        model.training.manual(.noticed)
+    }
+    private func registerPracticeShortcut() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let status = InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
+            guard let context else { return OSStatus(eventNotHandledErr) }
+            let owner = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
+            owner.noticedUrge()
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &practiceHandler)
+        guard status == noErr else { return }
+        let identifier = EventHotKeyID(signature: 0x4E474852, id: 1)
+        model.training.shortcutAvailable = RegisterEventHotKey(UInt32(kVK_ANSI_H), UInt32(controlKey | optionKey), identifier, GetApplicationEventTarget(), 0, &practiceHotKey) == noErr
+    }
     @objc func quit() {
         guard !model.dataBusy else { model.dataMessage = "Please wait for the data operation to finish before quitting."; openWindow(); return }
         model.stop(); NSApp.terminate(nil)
@@ -933,7 +1201,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         model.dataBusy ? .terminateCancel : .terminateNow
     }
-    func applicationWillTerminate(_ notification: Notification) { model.flush() }
+    func applicationWillTerminate(_ notification: Notification) {
+        model.training.end(); model.training.flush(); model.flush()
+        if let practiceHotKey { UnregisterEventHotKey(practiceHotKey) }
+        if let practiceHandler { RemoveEventHandler(practiceHandler) }
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 if CommandLine.arguments.contains("--self-test") {
@@ -962,11 +1234,20 @@ if CommandLine.arguments.contains("--self-test") {
     let oldSettings = Data(#"{"sensitivity":0.27,"hold":0.1,"overlayPosition":"Dół","repeatAlarm":true}"#.utf8)
     let migrated = Settings.load(oldSettings)
     precondition(migrated.sensitivity == 0.27 && migrated.hold == 0.1 && migrated.overlayPosition == "Bottom" && migrated.repeatAlarm && migrated.saveSnapshots)
+    precondition(Settings.load(nil).saveSnapshots)
+    precondition(Settings.load(Data(#"{"saveSnapshots":true}"#.utf8)).saveSnapshots)
+    precondition(!Settings.load(Data(#"{"saveSnapshots":false}"#.utf8)).saveSnapshots)
     let oldEpisode = Data(#"{"id":"00000000-0000-0000-0000-000000000001","start":0,"duration":1,"falseAlarm":true}"#.utf8)
     let legacy = try! JSONDecoder().decode(Episode.self, from: oldEpisode)
     precondition(legacy.falseAlarm && legacy.snapshotFile == nil && legacy.zones == nil)
     let compactSettings = Settings.load(Data(#"{"overlayStyle":"Compact","mouth":false,"hair":true,"custom":true}"#.utf8))
-    precondition(compactSettings.overlayStyle == "Card")
+    precondition(compactSettings.overlayStyle == "Card" && compactSettings.overlayAccent == "Red")
+    precondition(compactSettings.hrtCheckIn && compactSettings.hrtFinishSound == "Ping")
+    precondition(Settings.load(Data(#"{"hrtCheckIn":false,"hrtFinishSound":"None","hrtFinishVolume":9}"#.utf8)).hrtFinishVolume == 1)
+    precondition(Settings.load(Data(#"{"overlayAccent":"Blue"}"#.utf8)).overlayAccent == "Blue")
+    precondition(Settings.load(Data(#"{"overlayAccent":"unknown"}"#.utf8)).overlayAccent == Settings().overlayAccent)
+    try! testPractice()
+    try! testAlertRepeats()
     testMonitoringResume()
     testAppArtwork()
     testStatistics()

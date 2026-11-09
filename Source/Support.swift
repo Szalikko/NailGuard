@@ -28,6 +28,113 @@ let soundNames: [String] = {
     return Array(Set(found + ["Glass", "Ping", "Pop", "Sosumi", "Submarine"])).sorted()
 }()
 
+struct AlertEscalation {
+    private var lastAlert: TimeInterval?
+    private(set) var level = 0
+
+    mutating func begin(at time: TimeInterval) {
+        lastAlert = time
+        level = 0
+    }
+
+    mutating func repeatIfDue(at time: TimeInterval, interval: TimeInterval) -> Int? {
+        guard let lastAlert, time - lastAlert >= interval else { return nil }
+        self.lastAlert = time
+        level = min(level + 1, 3)
+        return level
+    }
+
+    mutating func reset() { self = AlertEscalation() }
+}
+
+final class BoostedAlertSound {
+    private var cachedName: String?
+    private var cachedVolume: Double?
+    private var sounds: [Int: NSSound] = [:]
+
+    func sound(named name: String, volume: Double, level: Int) -> NSSound? {
+        if name != cachedName || volume != cachedVolume {
+            sounds.removeAll()
+            cachedName = name
+            cachedVolume = volume
+        }
+        if let sound = sounds[level] { return sound }
+        guard let data = try? Self.makeWave(named: name, volume: volume, level: level),
+              let sound = NSSound(data: data) else { return nil }
+        sounds[level] = sound
+        return sound
+    }
+
+    fileprivate static func makeWave(named name: String, volume: Double, level: Int) throws -> Data? {
+        let folder = URL(fileURLWithPath: "/System/Library/Sounds")
+        guard let url = ["aiff", "wav", "caf"].map({ folder.appendingPathComponent(name).appendingPathExtension($0) })
+            .first(where: { FileManager.default.fileExists(atPath: $0.path) }) else { return nil }
+        let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
+        let format = file.processingFormat
+        guard file.length > 0, file.length <= Int64(format.sampleRate * 30),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(file.length)) else { return nil }
+        try file.read(into: buffer)
+        guard let channels = buffer.floatChannelData else { return nil }
+        let channelCount = UInt16(format.channelCount)
+        let sampleRate = UInt32(format.sampleRate.rounded())
+        let blockSize = channelCount * 2
+        let byteCount = UInt32(buffer.frameLength) * UInt32(blockSize)
+        var wave = Data(capacity: 44 + Int(byteCount))
+        func append<T: FixedWidthInteger>(_ value: T) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { wave.append(contentsOf: $0) }
+        }
+        wave.append(contentsOf: "RIFF".utf8); append(byteCount + 36)
+        wave.append(contentsOf: "WAVEfmt ".utf8); append(UInt32(16))
+        append(UInt16(1)); append(channelCount); append(sampleRate)
+        append(sampleRate * UInt32(blockSize)); append(blockSize); append(UInt16(16))
+        wave.append(contentsOf: "data".utf8); append(byteCount)
+
+        let gain = Float(volume * pow(10, Double(level * 2) / 20))
+        for frame in 0..<Int(buffer.frameLength) {
+            for channel in 0..<Int(channelCount) {
+                let sample = channels[channel][frame] * gain
+                let magnitude = abs(sample)
+                // Soft limiting preserves headroom when the amplified sample exceeds the digital ceiling.
+                let limited = magnitude <= 0.85 ? magnitude : 0.85 + 0.15 * tanh((magnitude - 0.85) / 0.15)
+                append(Int16((sample < 0 ? -limited : limited) * Float(Int16.max)))
+            }
+        }
+        return wave
+    }
+}
+
+func testAlertRepeats() throws {
+    var alert = AlertEscalation()
+    precondition(alert.repeatIfDue(at: 100, interval: 1) == nil)
+    alert.begin(at: 100)
+    precondition(alert.repeatIfDue(at: 100.9, interval: 1) == nil)
+    for (second, level) in [(101.0, 1), (102.0, 2), (103.0, 3), (104.0, 3)] {
+        precondition(alert.repeatIfDue(at: second, interval: 1) == level)
+    }
+    alert.reset()
+    alert.begin(at: 200)
+    precondition(alert.repeatIfDue(at: 205, interval: 5) == 1)
+    precondition(Settings.load(Data(#"{"repeatSeconds":30}"#.utf8)).repeatSeconds == 5)
+    precondition(Settings.load(Data(#"{"repeatSeconds":0}"#.utf8)).repeatSeconds == 1)
+
+    // Compare real system sound samples at the slider maximum, where NSSound volume alone cannot add gain.
+    var previousEnergy = 0.0
+    for level in 0...3 {
+        guard let wave = try BoostedAlertSound.makeWave(named: "Glass", volume: 1, level: level) else { break }
+        precondition(NSSound(data: wave) != nil)
+        let energy = wave.withUnsafeBytes { raw in
+            stride(from: 44, to: raw.count, by: 2).reduce(0.0) { total, offset in
+                let sample = Double(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int16.self)))
+                return total + sample * sample
+            }
+        }
+        precondition(energy > previousEnergy)
+        previousEnergy = energy
+    }
+    print("PASS: repeat timing, escalation cap and reset, legacy interval limits, boosted sound energy")
+}
+
 struct StatisticsWindow {
     var interval: DateInterval
     var hourly: Bool
@@ -174,11 +281,11 @@ func testAnalysisImage() {
 
 enum DataAction {
     case resetStatistics, deleteSnapshots
-    var title: String { self == .resetStatistics ? "Reset all statistics?" : "Delete all saved snapshots?" }
-    var button: String { self == .resetStatistics ? "Reset statistics" : "Delete snapshots" }
+    var title: String { self == .resetStatistics ? "Reset detection statistics?" : "Delete all saved snapshots?" }
+    var button: String { self == .resetStatistics ? "Reset detection statistics" : "Delete snapshots" }
     var explanation: String {
         self == .resetStatistics
-            ? "This permanently clears detection history and monitored-time totals. Saved snapshot files and your settings are kept. Monitoring will pause."
+            ? "This permanently clears detection history and monitored-time totals. Saved snapshots, practice statistics and your settings are kept. Monitoring will pause."
             : "Saved event photos will be moved to Trash and removed from event details. Detection history, totals and settings are kept. Monitoring will pause. You can recover the files from Trash."
     }
 }
